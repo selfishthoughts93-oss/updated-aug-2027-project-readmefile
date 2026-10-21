@@ -416,11 +416,13 @@ Restrict GCP firewall exposure to trusted IP ranges; do not expose administrativ
 
 ## 9. SonarQube + PostgreSQL playbook — `SonarQube-install.yml`
 
-This version avoids the previously failing ZIP download URL by using the `sonarqube:community` container image. It installs PostgreSQL on the SonarQube VM and runs the SonarQube container with host networking so it can connect to PostgreSQL at `127.0.0.1:5432`.
+This complete playbook installs Docker and PostgreSQL on the SonarQube VM, creates the database and role, configures the kernel limits, **pulls the SonarQube Community image, creates the `sonarqube` container, starts it, and waits for the status API to report `UP`**. It uses host networking so the container can reach PostgreSQL on the VM at `127.0.0.1:5432`; no SonarSource ZIP download is used, avoiding the previous HTTP 403 download endpoint.
 
-**Before running:** edit `postgres_password` in the playbook and replace `CHANGE_ME_STRONG_PASSWORD` with a strong password. For a better security posture, move the secret to Ansible Vault rather than storing it in plaintext. The playbook marks tasks containing the password with `no_log` where applicable.
+**Before running:** replace `CHANGE_ME_STRONG_PASSWORD` with a strong PostgreSQL password. Prefer Ansible Vault for secrets. Avoid single quotes in the placeholder password if using the SQL tasks below, or adapt the SQL quoting to your secret-management policy. This playbook includes `no_log` on the task that handles the password.
 
-Create `~/ansible/SonarQube-install.yml`:
+If the container was missing because an older YAML file was being run, replace the entire file on Jenkins with the code below. The key tasks to confirm are **Pull SonarQube Community image from Docker Hub** and **Create and start SonarQube container**.
+
+Create or replace `~/ansible/SonarQube-install.yml` with this complete code:
 
 ```yaml
 ---
@@ -430,10 +432,9 @@ Create `~/ansible/SonarQube-install.yml`:
   gather_facts: true
 
   vars:
-    sonar_user: sonar
     postgres_db: sonarqube
     postgres_user: sonar
-    # Replace with a strong password and preferably store it in Ansible Vault.
+    # Replace this placeholder before running. Prefer Ansible Vault for secrets.
     postgres_password: "CHANGE_ME_STRONG_PASSWORD"
     sonar_image: "sonarqube:community"
     sonar_data_dir: /opt/sonarqube/data
@@ -459,9 +460,10 @@ Create `~/ansible/SonarQube-install.yml`:
           - postgresql
           - postgresql-contrib
           - python3-docker
-          - curl
           - ca-certificates
+          - curl
           - procps
+          - unzip
         state: present
 
     - name: Enable and start Docker
@@ -476,13 +478,13 @@ Create `~/ansible/SonarQube-install.yml`:
         state: started
         enabled: true
 
-    - name: Create PostgreSQL role if missing, or update its password
+    - name: Create or update SonarQube PostgreSQL role
       ansible.builtin.shell: |
         set -euo pipefail
         if runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='{{ postgres_user }}'" | grep -q 1; then
-          runuser -u postgres -- psql -c "ALTER USER {{ postgres_user }} WITH PASSWORD '{{ postgres_password }}';"
+          runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "ALTER USER {{ postgres_user }} WITH PASSWORD '{{ postgres_password }}';"
         else
-          runuser -u postgres -- psql -c "CREATE USER {{ postgres_user }} WITH PASSWORD '{{ postgres_password }}';"
+          runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "CREATE USER {{ postgres_user }} WITH PASSWORD '{{ postgres_password }}';"
         fi
       args:
         executable: /bin/bash
@@ -503,19 +505,22 @@ Create `~/ansible/SonarQube-install.yml`:
       register: sonar_db_result
       changed_when: "'created' in sonar_db_result.stdout"
 
-    - name: Configure kernel limits required by Elasticsearch
+    - name: Configure kernel limits required by SonarQube Elasticsearch
       ansible.builtin.copy:
         dest: /etc/sysctl.d/99-sonarqube.conf
         owner: root
         group: root
-        mode: '0644'
+        mode: "0644"
         content: |
           vm.max_map_count=524288
           fs.file-max=131072
       register: sonar_sysctl_file
 
     - name: Apply kernel limits
-      ansible.builtin.command: sysctl --system
+      ansible.builtin.command:
+        argv:
+          - sysctl
+          - --system
       when: sonar_sysctl_file.changed
       changed_when: true
 
@@ -523,9 +528,9 @@ Create `~/ansible/SonarQube-install.yml`:
       ansible.builtin.file:
         path: "{{ item }}"
         state: directory
-        owner: '1000'
-        group: '1000'
-        mode: '0755'
+        owner: "1000"
+        group: "1000"
+        mode: "0755"
       loop:
         - "{{ sonar_data_dir }}"
         - "{{ sonar_extensions_dir }}"
@@ -536,13 +541,12 @@ Create `~/ansible/SonarQube-install.yml`:
         name: "{{ sonar_image }}"
         source: pull
 
-    - name: Start SonarQube container using host networking to reach local PostgreSQL
+    - name: Create and start SonarQube container
       community.docker.docker_container:
         name: sonarqube
         image: "{{ sonar_image }}"
         state: started
         restart_policy: unless-stopped
-        recreate: true
         network_mode: host
         env:
           SONAR_JDBC_URL: "jdbc:postgresql://127.0.0.1:5432/{{ postgres_db }}"
@@ -557,93 +561,130 @@ Create `~/ansible/SonarQube-install.yml`:
           - "nproc:8192:8192"
       no_log: true
 
-    - name: Wait for SonarQube HTTP endpoint
+    - name: Wait for SonarQube to report UP
       ansible.builtin.uri:
         url: http://127.0.0.1:9000/api/system/status
         method: GET
-        status_code: 200
+        return_content: true
+        status_code:
+          - 200
+          - 503
       register: sonar_http_status
-      retries: 30
+      retries: 36
       delay: 10
-      until: sonar_http_status.status == 200
+      until:
+        - sonar_http_status.status == 200
+        - sonar_http_status.json.status is defined
+        - sonar_http_status.json.status == "UP"
 
-    - name: Show SonarQube status
+    - name: Show SonarQube status and URL
       ansible.builtin.debug:
         msg:
-          - "SonarQube container is responding."
-          - "URL: http://10.10.0.5:9000 (allow access in GCP firewall only from trusted sources)."
+          - "SonarQube is reporting UP."
+          - "Internal URL: http://10.10.0.5:9000"
+          - "Container name: sonarqube"
           - "Image: {{ sonar_image }}"
 ```
 
-Validate and execute only the SonarQube group:
+Install the required collection on Jenkins, then validate and run:
 
 ```bash
+cd ~/ansible
+ansible-galaxy collection install community.docker
 ansible-playbook -i hosts SonarQube-install.yml --syntax-check
 ansible-playbook -i hosts SonarQube-install.yml --limit sonarqube
 ```
 
-The playbook pulls the image from Docker Hub, so the VM must be able to access Docker Hub. It waits for `http://127.0.0.1:9000/api/system/status` to return HTTP 200. If the image pull fails, inspect Docker Hub connectivity and container logs:
+Verify the result:
 
 ```bash
 ansible sonarqube -i hosts -b -m command -a "docker ps -a"
 ansible sonarqube -i hosts -b -m command -a "docker logs --tail 100 sonarqube"
+ansible sonarqube -i hosts -m uri -a "url=http://127.0.0.1:9000/api/system/status return_content=true"
 ```
 
-SonarQube internal URL: `http://10.10.0.5:9000`. Allow inbound TCP port 9000 only from trusted networks or through a secure proxy. The first startup can take several minutes.
+The expected container name is `sonarqube`. The image pull requires outbound access to Docker Hub. SonarQube may take several minutes on first startup. Internal URL: `http://10.10.0.5:9000`. Restrict TCP port 9000 in the GCP firewall to trusted sources.
+
+> **If `docker ps -a` shows no `sonarqube` container after a successful play recap, confirm that you replaced the entire playbook and ran `ansible-playbook -i hosts SonarQube-install.yml --limit sonarqube` from the correct `~/ansible` directory. The earlier task list in your screenshot ended at kernel limits, which means the playbook being executed did not include the image-pull and container-start tasks shown here.**
+
 
 ## 10. Jenkins installation playbook — `Jenkins-install.yml`
 
-This playbook targets the Jenkins controller through the local inventory entry. Run it from the Jenkins VM only after reviewing whether Jenkins is already installed; it installs Java 21, Maven, Docker, and Jenkins from the official Jenkins Debian repository.
+This playbook installs Java 21, Maven, Docker, and Jenkins on the Jenkins VM using the official Jenkins Debian repository. It runs locally on the controller via the `localhost` inventory entry. The updated key URL uses the 2026 key filename to address the `NO_PUBKEY 7198F47B14ABC68` error seen in your terminal, and validates the downloaded key with GPG before adding the repository.
 
-Create `~/ansible/Jenkins-install.yml`:
+Create or replace `~/ansible/Jenkins-install.yml` with this complete code:
 
 ```yaml
 ---
-# This playbook runs on the Jenkins VM itself via the localhost inventory entry.
 - name: Install Jenkins prerequisites and Jenkins on controller
   hosts: jenkins
   connection: local
   become: true
   gather_facts: true
+
+  vars:
+    jenkins_repo_key_url: "https://pkg.jenkins.io/debian-stable/jenkins.io-2026.key"
+    jenkins_repo_key_path: /etc/apt/keyrings/jenkins-keyring.asc
+
   tasks:
-    - name: Update apt package cache
+    - name: Update APT cache before installing prerequisites
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 3600
 
-    - name: Install Java 21 and utilities
+    - name: Install Java 21 and required utilities
       ansible.builtin.apt:
         name:
           - fontconfig
           - openjdk-21-jre
           - curl
+          - ca-certificates
           - gnupg
           - git
           - maven
           - docker.io
         state: present
+        update_cache: true
 
-    - name: Ensure apt keyrings directory exists
+    - name: Ensure APT keyrings directory exists
       ansible.builtin.file:
         path: /etc/apt/keyrings
         state: directory
-        mode: '0755'
+        owner: root
+        group: root
+        mode: "0755"
 
-    - name: Download Jenkins repository signing key
+    - name: Download current Jenkins repository signing key
       ansible.builtin.get_url:
-        url: https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
-        dest: /etc/apt/keyrings/jenkins-keyring.asc
-        mode: '0644'
+        url: "{{ jenkins_repo_key_url }}"
+        dest: "{{ jenkins_repo_key_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+        force: true
+        validate_certs: true
+      register: jenkins_key_download
 
-    - name: Configure Jenkins apt repository
+    - name: Verify downloaded Jenkins signing key is readable by GPG
+      ansible.builtin.command:
+        argv:
+          - gpg
+          - --batch
+          - --show-keys
+          - "{{ jenkins_repo_key_path }}"
+      changed_when: false
+
+    - name: Configure Jenkins APT repository with dedicated signing key
       ansible.builtin.apt_repository:
-        repo: "deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/"
+        repo: "deb [signed-by={{ jenkins_repo_key_path }}] https://pkg.jenkins.io/debian-stable binary/"
         filename: jenkins
         state: present
+        update_cache: false
 
-    - name: Refresh apt cache after adding Jenkins repository
+    - name: Refresh APT cache after configuring Jenkins repository
       ansible.builtin.apt:
         update_cache: true
+        cache_valid_time: 0
 
     - name: Install Jenkins package
       ansible.builtin.apt:
@@ -656,7 +697,7 @@ Create `~/ansible/Jenkins-install.yml`:
         state: started
         enabled: true
 
-    - name: Add Jenkins service account to Docker group
+    - name: Add Jenkins service account to Docker group when account exists
       ansible.builtin.user:
         name: jenkins
         groups: docker
@@ -668,27 +709,49 @@ Create `~/ansible/Jenkins-install.yml`:
         state: started
         enabled: true
 
-    - name: Verify Jenkins service
-      ansible.builtin.command: systemctl is-active jenkins
+    - name: Wait for Jenkins HTTP port to become reachable locally
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 8080
+        delay: 5
+        timeout: 180
+
+    - name: Verify Jenkins service state
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - jenkins
       register: jenkins_status
       changed_when: false
 
     - name: Display Jenkins service status
       ansible.builtin.debug:
-        var: jenkins_status.stdout
+        msg: "Jenkins service status: {{ jenkins_status.stdout }}"
 ```
 
-Validate and execute locally:
+Validate and execute:
 
 ```bash
+cd ~/ansible
 ansible-playbook -i hosts Jenkins-install.yml --syntax-check
 ansible-playbook -i hosts Jenkins-install.yml --limit jenkins
-sudo systemctl status jenkins --no-pager
-java -version
-mvn -version
 ```
 
-Jenkins web UI, if the GCP firewall allows access from your trusted client: `http://8.231.84.102:8080`. Restrict port 8080 to trusted source IPs or use a secured reverse proxy.
+Then verify on the Jenkins VM:
+
+```bash
+sudo systemctl status jenkins --no-pager
+sudo systemctl status docker --no-pager
+java -version
+mvn -version
+sudo journalctl -u jenkins -n 100 --no-pager
+```
+
+Jenkins UI: `http://8.231.84.102:8080`, provided GCP firewall rules allow access from your trusted client IP. Do not expose port 8080 to the entire internet.
+
+> **Signing-key note:** The key URL can change when Jenkins rotates repository signing keys. If the `jenkins.io-2026.key` URL returns 404 or APT still reports `NO_PUBKEY`, do not disable signature verification or use `trusted=yes`. Check the current key URL and fingerprint in the official [Jenkins Linux installation instructions](https://www.jenkins.io/doc/book/installing/linux/), update `jenkins_repo_key_url`, and rerun the playbook.
+
 
 ## 11. Run all playbooks in order
 
@@ -699,8 +762,8 @@ cd ~/ansible
 ansible-playbook -i hosts Basic-Packages-install.yml
 ansible-playbook -i hosts Docker-install.yml
 ansible-playbook -i hosts Monitoring-install.yml
-ansible-playbook -i hosts SonarQube-install.yml --limit sonarqube
 ansible-playbook -i hosts Jenkins-install.yml --limit jenkins
+ansible-playbook -i hosts SonarQube-install.yml --limit sonarqube
 ```
 
 If Jenkins and Ansible are already installed, you may not need to rerun `Jenkins-install.yml`. These playbooks are intended to be repeatable, but review any task that removes/recreates resources before rerunning it.
@@ -733,7 +796,9 @@ curl -fsS http://127.0.0.1:9000/api/system/status
 | Ansible `UNREACHABLE` | Test direct SSH first, then inspect inventory group/user/key path. |
 | `community.docker` module missing | Run `ansible-galaxy collection install community.docker` on Jenkins. |
 | Docker Hub pull failure | Check outbound internet/DNS and Docker daemon status on the target. |
-| SonarQube returns 403 from the ZIP endpoint | This playbook uses the Docker image instead of that ZIP endpoint. If Docker Hub is blocked, fix outbound access or configure an approved registry mirror. |
+| SonarQube returns 403 from the ZIP endpoint | The updated playbook uses the Docker image and does not download the SonarSource ZIP. Confirm the playbook contains the image-pull and container-start tasks; if Docker Hub is blocked, fix outbound access or configure an approved registry mirror. |
+| SonarQube container not found | Run `ansible sonarqube -i hosts -b -m command -a "docker ps -a"`; replace the whole `SonarQube-install.yml` with the current version in this runbook and rerun it. |
+| Jenkins `NO_PUBKEY` / repository not signed | Verify the current official Jenkins signing-key URL and fingerprint. Do not disable APT signature checking or set `trusted=yes`. |
 | SonarQube container starts but does not become healthy | Inspect `docker logs sonarqube`, memory availability, `vm.max_map_count`, database credentials, and PostgreSQL status. |
 | `sudo` password requested by Ansible | Run with `-K` to prompt for a sudo password, or configure a limited, policy-approved sudo rule. Avoid unrestricted `NOPASSWD: ALL` unless explicitly appropriate. |
 
